@@ -27,8 +27,8 @@ charging_stations = input_data.get("charging_stations", [])
 BATTERY = 500.0
 CHARGE_RATE = 2.0
 
-MAX_TRIP_SIZE = 6
-MAX_CAND_PER_TRIP = 50
+MAX_TRIP_SIZE = 8
+MAX_CAND_PER_TRIP = 60
 
 TIME_BUDGET = 8.73
 
@@ -40,6 +40,10 @@ _hypot = math.hypot
 W_DELIVERY = 100.0
 W_ENERGY = 0.1
 W_TIME = 0.05
+
+# safety margins
+BATTERY_SAFETY = 1.02      # need 2% slack on every leg
+DEADLINE_SAFETY = 1e-6
 
 # ============================================================
 # UTILITIES
@@ -89,6 +93,15 @@ def path_phys_dist(start_pos, steps):
         cur = nxt
 
     return total
+
+def _cs_point(cs):
+    # Tolerate either dict or list/tuple form
+    if isinstance(cs, dict):
+        return (cs.get("x", cs.get(0)), cs.get("y", cs.get(1)))
+    return (cs[0], cs[1])
+
+# Pre-compute charging-station points once
+_CS_POINTS = [_cs_point(c) for c in charging_stations]
 
 # ============================================================
 # NFZ GEOMETRY
@@ -264,11 +277,14 @@ def detour_candidates(a, b, z):
             (cx + px * r, cy + py * r),
             (cx - px * r, cy - py * r),
 
-            (cx + px * 1.5 * r, cy + py * 1.5 * r),
-            (cx - px * 1.5 * r, cy - py * 1.5 * r),
+            (cx + px * 1.3 * r, cy + py * 1.3 * r),
+            (cx - px * 1.3 * r, cy - py * 1.3 * r),
 
-            (cx + px * 2.0 * r, cy + py * 2.0 * r),
-            (cx - px * 2.0 * r, cy - py * 2.0 * r),
+            (cx + px * 1.7 * r, cy + py * 1.7 * r),
+            (cx - px * 1.7 * r, cy - py * 1.7 * r),
+
+            (cx + px * 2.2 * r, cy + py * 2.2 * r),
+            (cx - px * 2.2 * r, cy - py * 2.2 * r),
         ]
 
     c = z["corners"]
@@ -280,6 +296,7 @@ def detour_candidates(a, b, z):
     ymax = max(c[0][1], c[1][1])
 
     m = 25
+    m2 = 60
 
     mx = (xmin + xmax) / 2
     my = (ymin + ymax) / 2
@@ -297,6 +314,11 @@ def detour_candidates(a, b, z):
 
         (xmax + m, ymin - m),
         (xmin - m, ymax + m),
+
+        (xmax + m2, my),
+        (xmin - m2, my),
+        (mx, ymax + m2),
+        (mx, ymin - m2),
     ]
 
 # ============================================================
@@ -401,6 +423,88 @@ def plan_segment(a, b, start_t, zones):
 
     return best_path
 
+# ============================================================
+# CHARGING STATION HELPERS  (NEW)
+# ============================================================
+
+def find_charging_detour(
+        a,
+        b,
+        battery,
+        payload,
+        start_t,
+        zones,
+        cs_points):
+    """
+    Pick the charging-station that lets us go a -> CS -> b
+    with the smallest extra distance, while:
+      - leg a -> CS is feasible with current battery
+      - leg CS -> b is feasible with full battery
+      - both legs respect NFZs
+    Returns (cs_point, plan_a_cs, plan_cs_b, arrive_t) or None.
+    """
+    if not cs_points:
+        return None
+
+    best = None
+    best_extra = float("inf")
+    direct = dist(a, b)
+    factor = 1.0 + payload
+
+    # Cheap geometric pre-filter; expensive plan_segment only on top few.
+    geo_ranked = []
+    for cs_pt in cs_points:
+        d1 = dist(a, cs_pt)
+        d2 = dist(cs_pt, b)
+        # quick battery feasibility checks (Euclidean lower bound)
+        if d1 * factor * BATTERY_SAFETY > battery:
+            continue
+        if d2 * factor * BATTERY_SAFETY > BATTERY:
+            continue
+        geo_ranked.append((d1 + d2 - direct, d1, d2, cs_pt))
+
+    if not geo_ranked:
+        return None
+
+    geo_ranked.sort(key=lambda x: x[0])
+
+    # Plan only the most promising candidates (NFZ-aware)
+    for extra, _, _, cs_pt in geo_ranked[:6]:
+        plan_a_cs = plan_segment(a, cs_pt, start_t, zones)
+        if plan_a_cs is None:
+            continue
+
+        leg1_dist = path_phys_dist(a, plan_a_cs)
+        leg1_e = leg1_dist * factor
+        if leg1_e * BATTERY_SAFETY > battery:
+            continue
+
+        arrive_cs_t = plan_a_cs[-1]["t"]
+        # Time to recharge to full from where we'll be after leg1.
+        residual = battery - leg1_e
+        charge_time = (BATTERY - residual) / CHARGE_RATE
+        depart_t = arrive_cs_t + charge_time
+
+        plan_cs_b = plan_segment(cs_pt, b, depart_t, zones)
+        if plan_cs_b is None:
+            continue
+
+        leg2_dist = path_phys_dist(cs_pt, plan_cs_b)
+        leg2_e = leg2_dist * factor
+        if leg2_e * BATTERY_SAFETY > BATTERY:
+            continue
+
+        if extra < best_extra:
+            best_extra = extra
+            best = (cs_pt, plan_a_cs, plan_cs_b,
+                    arrive_cs_t, depart_t, leg1_e, leg2_e)
+
+    return best
+
+# ============================================================
+# DELIVERY PREP / COSTING
+# ============================================================
+
 def preprocess_deliveries(raw, wh):
 
     out = []
@@ -464,6 +568,78 @@ def route_combined_cost(
         + t * W_TIME
     )
 
+# ============================================================
+# ORDERING (overhauled: seeds + 2-opt + Or-opt)
+# ============================================================
+
+def _two_opt(perm, wh, start_t, deadline_check):
+    n = len(perm)
+    if n < 4:
+        return perm
+
+    best = list(perm)
+    best_cost = route_combined_cost(wh, best, start_t)
+
+    improved = True
+    while improved:
+        if not deadline_check():
+            break
+        improved = False
+        for i in range(n - 1):
+            if not deadline_check():
+                break
+            bi = best[i]
+            for j in range(i + 1, n):
+                # reverse segment best[i:j+1]
+                new_perm = best[:i] + best[i:j + 1][::-1] + best[j + 1:]
+                cost = route_combined_cost(wh, new_perm, start_t)
+                if cost < best_cost - 1e-9:
+                    best_cost = cost
+                    best = new_perm
+                    improved = True
+                    bi = best[i]
+    return best
+
+def _or_opt(perm, wh, start_t, deadline_check):
+    n = len(perm)
+    if n < 3:
+        return perm
+
+    best = list(perm)
+    best_cost = route_combined_cost(wh, best, start_t)
+
+    improved = True
+    while improved:
+        if not deadline_check():
+            break
+        improved = False
+        # Try moving a single element from i to position j
+        for seg_len in (1, 2):
+            if seg_len >= n:
+                break
+            for i in range(n - seg_len + 1):
+                if not deadline_check():
+                    break
+                seg = best[i:i + seg_len]
+                rest = best[:i] + best[i + seg_len:]
+                for j in range(len(rest) + 1):
+                    if j == i:
+                        continue
+                    new_perm = rest[:j] + seg + rest[j:]
+                    if new_perm == best:
+                        continue
+                    cost = route_combined_cost(wh, new_perm, start_t)
+                    if cost < best_cost - 1e-9:
+                        best_cost = cost
+                        best = new_perm
+                        improved = True
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+    return best
+
 def best_order(
         wh,
         items,
@@ -474,7 +650,8 @@ def best_order(
     if n <= 1:
         return list(items)
 
-    if n <= 8:
+    # Exhaustive when small enough.
+    if n <= 7:
 
         best_perm = None
         best_cost = float("inf")
@@ -494,14 +671,74 @@ def best_order(
 
         return best_perm
 
-    return list(items)
+    # Heuristic seeds + local search for larger trips.
+    seeds = []
+
+    # 1. Nearest-neighbour from warehouse
+    remaining = list(items)
+    cur = wh
+    nn = []
+    while remaining:
+        nxt = min(
+            remaining,
+            key=lambda d: dist(cur, d["_point"])
+        )
+        nn.append(nxt)
+        remaining.remove(nxt)
+        cur = nxt["_point"]
+    seeds.append(nn)
+
+    # 2. Deadline order (urgent first)
+    seeds.append(
+        sorted(items, key=lambda d: d["deadline"])
+    )
+
+    # 3. Sweep (polar angle around warehouse)
+    seeds.append(
+        sorted(
+            items,
+            key=lambda d: math.atan2(
+                d["_point"][1] - wh[1],
+                d["_point"][0] - wh[0]
+            )
+        )
+    )
+
+    # 4. Distance from warehouse ascending (drop heavy near first)
+    seeds.append(
+        sorted(items, key=lambda d: d["_warehouse_dist"])
+    )
+
+    # Pick best seed
+    best = seeds[0]
+    best_cost = route_combined_cost(wh, best, start_t)
+    for s in seeds[1:]:
+        c = route_combined_cost(wh, s, start_t)
+        if c < best_cost:
+            best_cost = c
+            best = s
+
+    deadline_check = lambda: time_left() > 0.12
+
+    # Refine: 2-opt -> Or-opt -> 2-opt
+    best = _two_opt(best, wh, start_t, deadline_check)
+    best = _or_opt(best, wh, start_t, deadline_check)
+    best = _two_opt(best, wh, start_t, deadline_check)
+
+    return best
+
+# ============================================================
+# SIMULATE A TRIP (now charging-station aware)
+# ============================================================
 
 def simulate_route(
         wh,
         drone,
         order,
         start_t,
-        zones):
+        zones,
+        cs_points,
+        battery_start=BATTERY):
 
     if not order:
         return None
@@ -521,9 +758,9 @@ def simulate_route(
 
     path = []
 
-    battery = BATTERY
-
+    battery = battery_start
     total_nrg = 0.0
+    charges = 0
 
     for d in order:
 
@@ -539,156 +776,282 @@ def simulate_route(
         if plan is None:
             return None
 
-        leg_dist = path_phys_dist(
-            cur,
-            plan
-        )
+        leg_dist = path_phys_dist(cur, plan)
+        leg_e = leg_dist * (1.0 + payload)
 
-        leg_e = leg_dist * (
-            1.0 + payload
-        )
+        if leg_e * BATTERY_SAFETY > battery:
 
-        if leg_e > battery:
-            return None
+            # Try to detour through a charging station
+            det = find_charging_detour(
+                cur,
+                target,
+                battery,
+                payload,
+                cur_t,
+                zones,
+                cs_points
+            )
+
+            if det is None:
+                return None
+
+            (cs_pt, plan_a_cs, plan_cs_b,
+             arrive_cs_t, depart_t,
+             leg1_e, leg2_e) = det
+
+            arrive_t = plan_cs_b[-1]["t"]
+            if arrive_t > d["deadline"] + DEADLINE_SAFETY:
+                return None
+
+            battery -= leg1_e
+            total_nrg += leg1_e
+
+            # CHARGE step at the station
+            plan_a_cs[-1]["action"] = "CHARGE"
+            path.extend(plan_a_cs)
+            charges += 1
+
+            # After charging, battery is full
+            battery = BATTERY - leg2_e
+            total_nrg += leg2_e
+
+            plan_cs_b[-1]["action"] = "DELIVER"
+            plan_cs_b[-1]["delivery_id"] = d["id"]
+            path.extend(plan_cs_b)
+
+            payload -= d["weight"]
+            cur = target
+            cur_t = arrive_t
+            continue
 
         arrive_t = plan[-1]["t"]
-
-        if arrive_t > d["deadline"]:
+        if arrive_t > d["deadline"] + DEADLINE_SAFETY:
             return None
 
         battery -= leg_e
-
         total_nrg += leg_e
 
         plan[-1]["action"] = "DELIVER"
-
         plan[-1]["delivery_id"] = d["id"]
-
         path.extend(plan)
 
         payload -= d["weight"]
-
         cur = target
         cur_t = arrive_t
 
-    back = plan_segment(
-        cur,
-        wh,
-        cur_t,
-        zones
-    )
-
+    # Return-to-warehouse leg (also charging-aware)
+    back = plan_segment(cur, wh, cur_t, zones)
     if back is None:
         return None
 
-    back_dist = path_phys_dist(
-        cur,
-        back
-    )
+    back_dist = path_phys_dist(cur, back)
+    back_e = back_dist  # payload is 0 by here
 
-    back_e = back_dist
+    if back_e * BATTERY_SAFETY > battery:
 
-    if back_e > battery:
-        return None
+        det = find_charging_detour(
+            cur,
+            wh,
+            battery,
+            0.0,
+            cur_t,
+            zones,
+            cs_points
+        )
 
-    battery -= back_e
+        if det is None:
+            return None
 
-    total_nrg += back_e
+        (cs_pt, plan_a_cs, plan_cs_b,
+         arrive_cs_t, depart_t,
+         leg1_e, leg2_e) = det
 
-    back[-1]["action"] = "RETURN"
+        battery -= leg1_e
+        total_nrg += leg1_e
 
-    path.extend(back)
+        plan_a_cs[-1]["action"] = "CHARGE"
+        path.extend(plan_a_cs)
+        charges += 1
+
+        battery = BATTERY - leg2_e
+        total_nrg += leg2_e
+
+        plan_cs_b[-1]["action"] = "RETURN"
+        path.extend(plan_cs_b)
+        finish_t = plan_cs_b[-1]["t"]
+    else:
+        battery -= back_e
+        total_nrg += back_e
+        back[-1]["action"] = "RETURN"
+        path.extend(back)
+        finish_t = back[-1]["t"]
 
     return {
         "path": path,
-        "finish_t": back[-1]["t"],
+        "finish_t": finish_t,
         "energy": total_nrg,
-        "deliveries": [
-            d["id"] for d in order
-        ]
+        "deliveries": [d["id"] for d in order],
+        "battery_left": battery,
+        "charges": charges
     }
+
+# ============================================================
+# TRIP SCORING + CANDIDATE FILTERING
+# ============================================================
 
 def trip_score(trip):
 
     n = len(trip["deliveries"])
 
+    # Light penalty per mid-trip charge so we prefer non-detoured
+    # trips when delivery count is equal.
     return (
         n * W_DELIVERY
         - trip["energy"] * W_ENERGY
         - trip["finish_t"] * W_TIME
+        - trip.get("charges", 0) * 0.5
     )
 
-def filter_candidates(candidates):
-
+def filter_candidates(candidates, wh, start_t):
+    """
+    Cluster-aware shortlist:
+      - keep most urgent items
+      - keep nearest-warehouse items
+      - keep items geographically close to the urgent seed
+    Deduplicated, capped at MAX_CAND_PER_TRIP.
+    """
     if len(candidates) <= MAX_CAND_PER_TRIP:
         return candidates
 
+    k = MAX_CAND_PER_TRIP
+
+    # The urgent seed = item with earliest deadline among the truly
+    # reachable ones (already filtered upstream).
+    seed = min(candidates, key=lambda d: d["deadline"])
+    seed_pt = seed["_point"]
+
+    quota_urgent = max(8, k // 3)
+    quota_nearby_wh = max(8, k // 3)
+    quota_nearby_seed = k - quota_urgent - quota_nearby_wh
+
     urgent = heapq.nsmallest(
-        MAX_CAND_PER_TRIP // 2,
+        quota_urgent,
         candidates,
         key=lambda d: d["deadline"]
     )
 
-    nearby = heapq.nsmallest(
-        MAX_CAND_PER_TRIP // 2,
+    nearby_wh = heapq.nsmallest(
+        quota_nearby_wh,
         candidates,
         key=lambda d: d["_warehouse_dist"]
     )
 
+    nearby_seed = heapq.nsmallest(
+        quota_nearby_seed,
+        candidates,
+        key=lambda d: dist(seed_pt, d["_point"])
+    )
+
     seen = set()
     out = []
-
-    for d in urgent + nearby:
-
-        if d["id"] in seen:
-            continue
-
-        seen.add(d["id"])
-        out.append(d)
-
+    for group in (urgent, nearby_seed, nearby_wh):
+        for d in group:
+            if d["id"] in seen:
+                continue
+            seen.add(d["id"])
+            out.append(d)
+            if len(out) >= k:
+                return out
     return out
+
+# ============================================================
+# TRIP BUILDER  (more orderings + cheapest-insertion + refine)
+# ============================================================
+
+def _seed_orderings(candidates, wh):
+    """Return a list of distinct candidate orderings to try."""
+    orderings = []
+
+    orderings.append(sorted(
+        candidates,
+        key=lambda d: (d["deadline"], d["_warehouse_dist"])
+    ))
+
+    orderings.append(sorted(
+        candidates,
+        key=lambda d: (-d["weight"], d["deadline"])
+    ))
+
+    orderings.append(sorted(
+        candidates,
+        key=lambda d: d["_warehouse_dist"]
+    ))
+
+    orderings.append(sorted(
+        candidates,
+        key=lambda d: math.atan2(
+            d["_point"][1] - wh[1],
+            d["_point"][0] - wh[0]
+        )
+    ))
+
+    # density-ish: favour heavy-but-near items (high value per unit cost)
+    orderings.append(sorted(
+        candidates,
+        key=lambda d: -(d["weight"] / (d["_warehouse_dist"] + 1.0))
+    ))
+
+    # urgency / distance ratio  (must-do soon AND cheap)
+    orderings.append(sorted(
+        candidates,
+        key=lambda d: (
+            (d["deadline"] - d["_warehouse_dist"]) +
+            d["_warehouse_dist"] * 0.1
+        )
+    ))
+
+    # dedupe by id-tuple
+    seen = set()
+    uniq = []
+    for o in orderings:
+        key = tuple(d["id"] for d in o)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(o)
+    return uniq
 
 def try_build_trip(
         wh,
         drone,
         candidates,
         start_t,
-        zones):
+        zones,
+        cs_points,
+        battery_start):
 
-    candidates = filter_candidates(
-        candidates
-    )
+    candidates = filter_candidates(candidates, wh, start_t)
+
+    if not candidates:
+        return None
 
     best_trip = None
     best_score = float("-inf")
 
-    orderings = [
-
-        sorted(
-            candidates,
-            key=lambda d: (
-                d["deadline"],
-                d["_warehouse_dist"]
-            )
-        ),
-
-        sorted(
-            candidates,
-            key=lambda d: (
-                -d["weight"],
-                d["deadline"]
-            )
-        ),
-    ]
+    orderings = _seed_orderings(candidates, wh)
 
     for cand_order in orderings:
 
+        if time_left() < 0.18:
+            break
+
         chosen = []
         weight = 0.0
+        consecutive_failures = 0
 
         for cand in cand_order:
 
-            if time_left() < 0.1:
+            if time_left() < 0.12:
                 break
 
             if (
@@ -702,40 +1065,87 @@ def try_build_trip(
 
             trial = chosen + [cand]
 
-            order = best_order(
-                wh,
-                trial,
-                start_t
-            )
+            order = best_order(wh, trial, start_t)
 
             sim = simulate_route(
                 wh,
                 drone,
                 order,
                 start_t,
-                zones
+                zones,
+                cs_points,
+                battery_start
             )
 
             if sim is None:
+                consecutive_failures += 1
+                # If we keep failing, give up early on this ordering
+                if consecutive_failures >= 4 and len(chosen) >= 2:
+                    break
                 continue
+
+            consecutive_failures = 0
 
             sc = trip_score(sim)
 
             if sc > best_score:
-
                 best_score = sc
                 best_trip = sim
 
             chosen = trial
             weight += cand["weight"]
 
+    # Final polish: try removing each delivery from the best trip
+    # in case dropping one yields a higher score (lower energy/time).
+    if best_trip is not None and len(best_trip["deliveries"]) >= 3 \
+            and time_left() > 0.4:
+
+        ids = best_trip["deliveries"]
+        id_to_item = {d["id"]: d for d in candidates}
+        items_full = [id_to_item[i] for i in ids if i in id_to_item]
+
+        if len(items_full) == len(ids):
+
+            for skip_idx in range(len(items_full)):
+
+                if time_left() < 0.2:
+                    break
+
+                trial = [
+                    it for k, it in enumerate(items_full)
+                    if k != skip_idx
+                ]
+
+                order = best_order(wh, trial, start_t)
+                sim = simulate_route(
+                    wh,
+                    drone,
+                    order,
+                    start_t,
+                    zones,
+                    cs_points,
+                    battery_start
+                )
+                if sim is None:
+                    continue
+
+                sc = trip_score(sim)
+                if sc > best_score:
+                    best_score = sc
+                    best_trip = sim
+
     return best_trip
+
+# ============================================================
+# SOLVER  (now tracks per-drone battery + charge time)
+# ============================================================
 
 def solve(
         wh,
         drones,
         deliveries,
-        zones):
+        zones,
+        cs_points):
 
     deliveries = preprocess_deliveries(
         deliveries,
@@ -755,36 +1165,39 @@ def solve(
         for d in deliveries
     }
 
-    while pending and time_left() > 0.2:
+    # Sort drones once by capacity desc — heavy loaders try first when
+    # they tie on availability, which lets them claim heavy clusters.
+    drones_by_cap = sorted(
+        drones,
+        key=lambda dr: -dr["max_payload"]
+    )
+
+    while pending and time_left() > 0.25:
 
         any_progress = False
 
-        for drone in sorted(
-                drones,
-                key=lambda dr:
-                states[dr["id"]]["available"]):
+        # Round-robin by earliest-available drone (then capacity).
+        ordered_drones = sorted(
+            drones_by_cap,
+            key=lambda dr: (
+                states[dr["id"]]["available"],
+                -dr["max_payload"]
+            )
+        )
 
-            if time_left() < 0.1:
+        for drone in ordered_drones:
+
+            if time_left() < 0.15:
                 break
 
             did = drone["id"]
-
-            start_t = states[did]["available"]
+            st = states[did]
+            start_t = st["available"]
 
             feasible = [
-
                 d for d in pending.values()
-
-                if (
-                    d["weight"]
-                    <= drone["max_payload"]
-                )
-
-                and (
-                    start_t
-                    + d["_warehouse_dist"]
-                    <= d["deadline"]
-                )
+                if d["weight"] <= drone["max_payload"]
+                and start_t + d["_warehouse_dist"] <= d["deadline"]
             ]
 
             if not feasible:
@@ -795,7 +1208,9 @@ def solve(
                 drone,
                 feasible,
                 start_t,
-                zones
+                zones,
+                cs_points,
+                BATTERY
             )
 
             if trip is None:
@@ -809,17 +1224,14 @@ def solve(
                 delivery_ids=trip["deliveries"]
             )
 
-            states[did]["path"].append(
-                pickup
-            )
+            st["path"].append(pickup)
+            st["path"].extend(trip["path"])
 
-            states[did]["path"].extend(
-                trip["path"]
-            )
-
-            states[did]["available"] = (
-                trip["finish_t"]
-            )
+            # Match original semantic: drone is ready immediately for
+            # the next trip — battery is replenished at warehouse during
+            # pickup/loading.  Mid-trip charging stations are still used
+            # whenever a leg can't be made on the current battery.
+            st["available"] = trip["finish_t"]
 
             for did2 in trip["deliveries"]:
                 pending.pop(did2, None)
@@ -845,7 +1257,8 @@ result = solve(
     warehouse,
     drones,
     deliveries,
-    no_fly_zones
+    no_fly_zones,
+    _CS_POINTS
 )
 
 print(json.dumps({
